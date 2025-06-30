@@ -1,0 +1,1374 @@
+---
+title: "Feature production markdown for Detecting Postural Instability in Parkinson's Disease from IMU-based Objective Measures"
+subtitle: "Feature Production"
+author: "Kendal Raymond William Smith <ksmi3341@alumni.sydney.edu.au>"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    number_sections: no
+    toc: no
+    keep_tex: yes
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '3'
+fontsize: 10pt
+editor_options: 
+  chunk_output_type: inline
+geometry: "left=2.5cm,right=2.5cm,top=2.05cm,bottom=2.5cm"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+```{r libraries, include=FALSE}
+# Install any needed package
+if (!require(tidyverse)) install.packages("tidyverse")
+# if (!require(doParallel)) install.packages("doParallel")
+# if (!require(foreach)) install.packages("foreach")
+if (!require(corrplot)) install.packages("corrplot")
+if (!require(rstatix)) install.packages("rstatix")
+if (!require(pROC)) install.packages("pROC")
+if (!require(zoo)) install.packages("zoo")
+if (!require(tidymodels)) install.packages("tidymodels")
+
+
+# if (!require(agua)) install.packages("agua")
+# if (!require(parallel)) install.packages("parallel")
+
+
+# LOAD REQUIRED libraries, rest are loaded as sub-libraries.
+library(tidyverse) # for manipulating data
+library(corrplot) # to plot the correlation matrix
+library(rstatix) # for effect size calculation
+library(pROC) # for ROC AUC analysis
+library(tidymodels) # for recipes only, later for ML and Statistical modelling
+library(zoo) # this is used for the rollmean function.
+#library(doParallel) # to run the training on multiple cores
+
+
+# parallel processing if available
+ncores <- detectCores(logical = FALSE) - 1
+# doParallel::registerDoParallel(cores = ncores)
+
+# library(agua)
+# library(parallel)
+
+```
+
+## Classification groups and bootstraps
+
+```{r group_selection, echo=FALSE}
+
+# set these up to decide which groups to classify between.
+# e.g. choose 0 and 1 or 1 and 2 or 2 and 3. 2 and 3 is the default.
+# note that segments are 100% perfect for 2 and 3, but for some subjects
+# other groups may need adjusting.
+group_A <- 2
+group_B <- 3
+
+# bootstraps, N selected through simulations
+B <- 1100
+
+
+```
+
+## Import all items from csv:
+
+
+```{r import_from_csv, echo = FALSE}
+
+# import all needed files from feature-production.Rmd
+features <- read.csv("features.csv")
+p_values <- read.csv("p_values.csv")
+feature_outliers <- 
+  read.csv("feature_outliers.csv")
+
+subjects <- read.csv("subjects.csv")
+
+
+```
+
+## Add age
+
+```{r}
+
+# Merge the dataframes
+features$age <- subjects$age[match(features$Subject, subjects$sub_num)]
+
+features <- features[, c("Subject", "HYclass", "age", 
+                         setdiff(names(features), c("Subject", "HYclass", "age")))]
+
+
+```
+
+### p_value
+
+
+```{r}
+
+# Extract age values for HYclass 2 and 3
+age_HYclass2 <- features$age[features$HYclass == group_A]
+age_HYclass3 <- features$age[features$HYclass == group_B]
+
+# Perform the Mann-Whitney U test / wilcoxon rank sum test
+p_values$age <-wilcox.test(age_HYclass2, age_HYclass3)$p.value
+
+# RETURNED VALUE:
+# > p_values$age
+# [1] 0.3801927
+
+
+```
+
+
+## Recipe setups
+
+```{r initial_recipe, echo = FALSE}
+
+
+# Define the recipe for preprocessing
+recipe_initial <- recipe(HYclass ~., data = features) %>%
+  # Filter for only HYclass A and B (default 2 and 3)
+  step_filter(HYclass %in% c(group_A, group_B) ) %>%
+  # make HYclass a factor
+  step_mutate(HYclass = factor(HYclass)) %>%
+  update_role(Subject, new_role = "ID") 
+
+# Define the recipe for bootstrap analysis preprocessing
+recipe_initial_b <- recipe(HYclass ~., data = features) %>%
+  # Filter for only HYclass A and B (default 2 and 3)
+  step_filter(HYclass %in% c(group_A, group_B) ) %>%
+  # make HYclass a factor
+  step_mutate(HYclass = factor(HYclass)) %>%
+  update_role(Subject, new_role = "ID") %>%
+  step_corr(all_numeric(), -all_outcomes(), -has_role("ID"), threshold = 0.95)
+
+
+# Prepare and process the data with the initial recipe
+features_preprocessed <- recipe_initial %>%
+  prep() %>%
+  bake(new_data = NULL)
+
+# Prepare and process data with boot assessment recipe
+features_preprocessed_b <- recipe_initial_b %>%
+  prep() %>%
+  bake(new_data = NULL)
+
+# Define the recipe for cross validation
+  recipe_cv <- recipe(HYclass ~., data = features_preprocessed) %>%
+    update_role(Subject, new_role = "ID") %>%
+    step_YeoJohnson(all_predictors(), -all_outcomes()) %>%
+    step_center(all_predictors(), -all_outcomes()) %>%
+    step_scale(all_predictors(), -all_outcomes())
+  
+# Define the recipe for cross validation and PCA - not used by default.
+  recipe_cv_b <- recipe(HYclass ~., data = features_preprocessed_b) %>%
+    update_role(Subject, new_role = "ID") %>%
+    step_YeoJohnson(all_predictors(), -all_outcomes()) %>%
+    step_center(all_predictors(), -all_outcomes()) %>%
+    step_scale(all_predictors(), -all_outcomes()) %>%
+    step_pca(all_numeric(), -all_outcomes(), -has_role("ID"), threshold = 0.995)
+  
+# Prepare and process the data with the cv recipe created for plotting
+# and also for variable importance scores
+features_transformed <- recipe_cv %>%
+  prep() %>%
+  bake(new_data = NULL)
+
+
+```
+
+
+## divide into axes
+
+```{r}
+
+# divide features into each axis
+# keep thse columns
+fixed_columns <- c("HYclass", "Subject", "age")
+
+# Extract column names that match the specific patterns
+patterns <- c("_AP$", "_ML$", "_VT$", "_Pitch$", "_Roll$", "_Yaw$")
+matching_columns <- lapply(patterns, function(pattern) grep(pattern, colnames(features), value = TRUE))
+
+# Extract values ending in ...
+features_AP <- features[, c(fixed_columns, matching_columns[[1]])]
+
+# For the non-matching (multi-domain) features
+non_matching <- !Reduce(`|`, lapply(patterns, function(x) grepl(x, colnames(features))))
+features_Multi_domain <- features[, colnames(features)[non_matching]]
+
+
+
+```
+
+
+## Heatmap
+
+```{r heatmap, echo = FALSE, fig.height=21, fig.width=15}
+# drop HYclass and subject ID for the correlation plot
+data <- features_AP[, -c(1, 2)]
+
+# create the correlation matrix object
+corr_matrix <- cor(data, use = "complete.obs")
+
+# set the colours, red (hot) for positive blue (cold) for negative correlation
+colours <- colorRampPalette(c("blue2", "blue", "royalblue3", "royalblue1", 
+                              "white", "white", 
+                              "indianred1", "brown1", "red", "red2"))(200)
+
+# plot it using corrplot
+corrplot(corr_matrix, method = "color", 
+         type = "lower", diag = FALSE, 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.6, col = colours, 
+         mar = c(0, 0, 4, 4), 
+         cex.main = 5,
+         bg = "transparent", 
+         main = "Feature heat-map")
+
+```
+
+### Correlation review
+
+```{r correlation_review, echo = FALSE}
+# Calculate the mean of the absolute values for each row
+# and cut off all low correlation variables
+mean_corr_column <- sort(apply(corr_matrix, 1, function(x) mean(abs(x))))
+low_mean_corr_column <- mean_corr_column[mean_corr_column <= 0.30]
+
+# run stats on high inter-correlations
+corr_matrix_abs <- abs(corr_matrix)
+
+# percentage of highly correlated pairs for each level.
+high_corrs_65 <- corr_matrix_abs[corr_matrix_abs >= 0.65]
+high_corrs_65 <- high_corrs_65[high_corrs_65 < 1]
+length(high_corrs_65)/(161*160)
+
+high_corrs_75 <- corr_matrix_abs[corr_matrix_abs >= 0.75]
+high_corrs_75 <- high_corrs_75[high_corrs_75 < 1]
+length(high_corrs_75)/(161*160)
+
+high_corrs_85 <- corr_matrix_abs[corr_matrix_abs >= 0.85]
+high_corrs_85 <- high_corrs_85[high_corrs_85 < 1]
+length(high_corrs_85)/(161*160)
+
+high_corrs_95 <- corr_matrix_abs[corr_matrix_abs >= 0.95]
+high_corrs_95 <- high_corrs_95[high_corrs_95 < 1]
+length(high_corrs_95)/(161*160)
+
+high_corrs_995 <- corr_matrix_abs[corr_matrix_abs >= 0.995]
+high_corrs_995 <- high_corrs_995[high_corrs_995 < 1]
+length(high_corrs_995)/(161*160)
+
+low_corrs <- corr_matrix_abs[corr_matrix_abs <= 0.3]
+length(low_corrs)/(161*160)
+
+low_corrs_40 <- corr_matrix_abs[corr_matrix_abs <= 0.4]
+length(low_corrs_40)/(161*160)
+
+```
+
+```{r high_corr_pairs, echo = FALSE}
+# # This evaludation allows a close look at features which are so similar
+# # the correlation of information contained within is more than 99.5%
+# 
+# # Get variable names from the corr object
+# var_names <- colnames(corr_matrix)
+# 
+# # Store the high correlation pairs in this df
+# high_corr_pairs <- data.frame(Var1 = character(), 
+#                               Var2 = character(), 
+#                               Correlation = numeric())
+# 
+# # Loop through the matrix
+# for (i in 1:(ncol(corr_matrix) - 1)) {
+#     for (j in (i + 1):ncol(corr_matrix)) {
+#         # Check if the correlation is greater than 0.995
+#         if (corr_matrix[i, j] > 0.995) {
+#             # Add the pair and their correlation to df
+#             high_corr_pairs <- rbind(high_corr_pairs, 
+#                                      data.frame(Var1 = var_names[i], 
+#                                                 Var2 = var_names[j], 
+#                                                 Correlation = corr_matrix[i, j]))
+#         }
+#     }
+# }
+# 
+# # Print
+# print(high_corr_pairs)
+
+
+```
+
+## Age compensation for missing age subject
+
+```{r}
+# for averaging group 2 age
+ages_hy2 <- subjects$age[subjects$stage == 2 & !is.na(subjects$stage)]
+ages_hy3 <- subjects$age[subjects$stage == 3 & !is.na(subjects$stage)]
+#mean(ages_hy2, na.rm = TRUE)
+
+# Filter the data frame
+features_AP_2_3 <- features_AP[features_AP$HYclass == 2 | features_AP$HYclass == 3, ]
+
+# add the average for subject 10, HYclass 2, missing age data:
+features_AP_2_3$age[2] <- mean(ages_hy2, na.rm = TRUE)
+#features_AP_2_3$age[2] <- mean(c(ages_hy2, ages_hy3), na.rm = TRUE)
+# features_AP_2_3$age[2] <- 110
+
+```
+
+### Regressions vs age
+
+```{r}
+
+# Select the columns for which we need to create polynomial regression objects
+features_for_regression <- features_AP_2_3 %>%
+  dplyr::select(-HYclass, -age)
+
+# Initialize an empty list to store regression objects
+regression_list <- list()
+
+# Function to rename coefficients
+rename_coefficients <- function(model) {
+  coef_names <- names(coef(model))
+  coef_names <- gsub("poly\\(age, 2\\)1", "x1", coef_names)
+  coef_names <- gsub("poly\\(age, 2\\)2", "x2", coef_names)
+  
+  coefs <- coef(model)
+  names(coefs) <- coef_names
+  
+  model$coefficients <- coefs
+  return(model)
+}
+
+# Loop through each feature and create polynomial regression objects
+for (feature_name in colnames(features_for_regression)) {
+  formula <- as.formula(paste(feature_name, "~ stats::poly(age, 2)"))
+  model <- lm(formula, data = features_AP_2_3)
+  model <- rename_coefficients(model)
+  regression_list[[feature_name]] <- model
+}
+
+# Convert the list to a data frame
+age_regressions <- data.frame(feature = names(regression_list), model = I(regression_list))
+
+
+```
+
+### Review R-squared
+
+```{r}
+
+# Initialize an empty list to store R-squared values
+r_squared_list <- list()
+
+# Loop through each model to extract R-squared values
+for (feature_name in names(regression_list)) {
+  model <- regression_list[[feature_name]]
+  r_squared <- summary(model)$r.squared
+  r_squared_list[[feature_name]] <- r_squared
+}
+
+# Convert the list to a data frame
+r_squared_df <- data.frame(feature = names(r_squared_list), r_squared = unlist(r_squared_list))
+
+# Display the R-squared values
+print(r_squared_df)
+
+
+```
+
+### taking residuals
+
+
+```{r}
+# these are needed to the actual evaluation
+
+# Initialize the residuals data frame with Subject, HYclass, and age from the original data frame
+residuals_AP_2_3 <- features_AP_2_3 %>%
+  dplyr::select(Subject, HYclass, age)
+
+# Loop through each feature and add the residuals to the residuals data frame
+for (feature_name in colnames(features_AP_2_3)) {
+  if (!(feature_name %in% c("Subject", "HYclass", "age"))) {
+    # Extract the residuals from the regression model
+    residuals_AP_2_3[[feature_name]] <- age_regressions$model[[feature_name]]$residuals
+  }
+}
+
+
+```
+
+
+### plots
+
+```{r}
+
+# Reshape the data from wide to long format for plotting
+features_long <- features_AP_2_3 %>%
+  dplyr::select(-HYclass) %>%
+  pivot_longer(cols = -age, names_to = "feature", values_to = "value")
+
+# Add back the HYclass column
+features_long$HYclass <- rep(features_AP_2_3$HYclass, times = ncol(features_AP_2_3) - 2)
+
+# Function to add predictions to the data frame
+add_predictions <- function(df, models) {
+  df <- df %>%
+    group_by(feature) %>%
+    mutate(predicted = predict(models[[unique(feature)]], newdata = data.frame(age = age)))
+  return(df)
+}
+
+# Add predictions to the data frame
+features_long <- add_predictions(features_long, regression_list)
+
+# Create the dot plot with a single polynomial regression line for each feature
+ggplot(features_long, aes(x = age, y = value)) +
+  geom_point(aes(color = factor(HYclass))) +
+  geom_line(aes(y = predicted), color = "black") +
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(title = "Dot Plot of Age vs Features with Polynomial Regression",
+       x = "Age",
+       y = "Feature Value",
+       color = "HYclass") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+## Sample size calculation
+
+### Wilcox effect size
+
+```{r}
+
+# Create new effect size dataframe from p_values, initializing with 0
+Effect <- p_values
+Effect[] <- 0
+
+for (feature_name in colnames(features_preprocessed)) {
+  
+  # Skip 'Subject' and 'HYclass' columns
+  if (feature_name %in% c("HYclass", "Subject")) next
+  
+  # Create a formula for assessment
+  dynamic_formula <- as.formula(paste(feature_name, "~ HYclass"))
+
+  # Check if the current feature column contains Inf or -Inf values
+  if (any(is.infinite(features_preprocessed[[feature_name]]))) {
+    # If Inf or -Inf values are present, set effect size to 0
+    Effect[[feature_name]] <- 0
+  } else {
+    # If no Inf or -Inf values, perform the effect size assessment
+    Effect[[feature_name]] <- wilcox_effsize(features_preprocessed[, c("HYclass", feature_name)],
+                                             dynamic_formula, paired = FALSE,
+                                             alternative = "two.sided")$effsize
+  }
+}
+
+
+```
+
+
+
+
+#### With age adjustment
+
+```{r}
+
+
+p_values_AP <- p_values[, grep("_AP$", colnames(p_values))]
+
+# Create new effect size dataframe from p_values, initializing with 0
+effect_values_AP <- p_values_AP
+effect_values_AP[] <- 0
+
+for (feature_name in colnames(residuals_AP_2_3)) {
+
+  # Skip 'Subject' and 'HYclass' columns
+  if (feature_name %in% c("HYclass", "Subject")) next
+
+  # Create a formula for assessment
+  dynamic_formula <- as.formula(paste(feature_name, "~ HYclass"))
+
+  # Check if the current feature column contains Inf or -Inf values
+  if (any(is.infinite(residuals_AP_2_3[[feature_name]]))) {
+    # If Inf or -Inf values are present, set effect size to 0
+    effect_values_AP[[feature_name]] <- 0
+  } else {
+    # If no Inf or -Inf values, perform the effect size assessment
+    effect_values_AP[[feature_name]] <- wilcox_effsize(residuals_AP_2_3[, c("HYclass",
+                                                                       feature_name)],
+                                             dynamic_formula,
+                                             alternative = "two.sided")$effsize
+  }
+}
+
+
+
+```
+
+### cohen d
+
+```{r}
+
+# needed only if cohen is needed
+
+# features_transformed_x <- features_transformed %>%
+#   dplyr::select(-Subject) # Remove the ID column
+# 
+# # group sizes
+# n1 <- 19
+# n2 <- 11
+# 
+# n <- (2 * n1 * n2) / (n1 + n2) # pooled sample size
+# 
+# # Cohen's d function
+# calculate_d <- function(x, y) {
+#   lx <- mean(x)
+#   ly <- mean(y)
+#   sx <- sd(x)
+#   sy <- sd(y)
+#   pooled_sd <- sqrt(((n1 - 1) * sx^2 + (n2 - 1) * sy^2) / (n1 + n2 - 2))
+#   d <- (lx - ly) / pooled_sd
+#   return(d)
+# }
+# 
+# # calculate Cohen's d
+# ds <- sapply(features_transformed_x[-which(names(features_transformed_x) == "HYclass")], function(feature) {
+#   group1 <- features_transformed_x$HYclass == 2
+#   group2 <- features_transformed_x$HYclass == 3
+#   d <- calculate_d(feature[group2], feature[group1])
+#   return(d)
+# })
+# 
+# d = mean(ds)
+
+```
+
+
+### power t test
+
+```{r}
+# used only if t test is used instead of Mann-Whitney U test. Not advised as
+# not all feature distributions appear completely normal even after
+# Yeo-Johnsonisation
+
+# t.test is assumed to give general result
+# 
+# library(pwr)
+# 
+# n <- (2 * n1 * n2) / (n1 + n2)
+
+# Perform power calculation - do it in the BH p-value assessment loop....
+# pwr <- pwr.t.test(d = ds, sig.level = 0.05, power = NULL,  n = n,
+#                      type = "two.sample", alternative = "two.sided")$power
+# 
+# power <- as.data.frame(t(data.frame(feature = names(pwr), power = as.numeric(pwr))))
+# colnames(power) <- power[1,]
+# power <- power[-1,]
+
+```
+
+
+
+## Print all p-values
+
+
+```{r}
+### WARNING ###
+# MUST re-do P values for AGE confounder adjustment!!!
+### WARNING ###
+
+
+# p values per axes
+# Extract values ending in ...
+p_values_AP <- p_values[, grep("_AP$", colnames(p_values))]
+
+# Extract values not matching the previous assuming it is the multi domain one
+patterns <- c("_AP$", "_ML$", "_VT$", "_Pitch$", "_Roll$", "_Yaw$")
+non_matching = !Reduce(`|`, lapply(patterns, function(x) grepl(x, colnames(p_values))))
+p_values_Multi_domain <- p_values[, non_matching]
+
+p_values_single_axes <- p_values_single_axes <- cbind(p_values_AP)
+
+
+```
+
+
+```{r p_value_print, echo = FALSE}
+
+## These are the p-values for groups 2 and 3 only. To obtain p-values for
+## other groups, feature-production.Rmd must be run with these groups
+## set with group_A and group_B objects.
+
+for (col_name in colnames(p_values)) {
+  # get the p-value
+  p_val <- p_values[[col_name]][1]
+
+  # Check if p_val is NA
+  if (is.na(p_val)) {
+    significance = " _Data Missing_"
+  } else {
+    # Determine the significance level
+    if (p_val < 0.0001) {
+      significance = "***"
+    } else if (p_val < 0.001) {
+      significance = "**"
+    } else if (p_val < 0.01) {
+      significance = "*"
+    } else if (p_val < 0.05) {
+      significance = "-"
+    } else {
+      significance = " _Not Significant_"
+    }
+  }
+
+  # Print the p-value with significance symbol
+  cat(col_name, ":", p_val, significance, "\n")
+}
+
+
+```
+
+### p-values with age adjustment
+
+```{r}
+
+# Initialize a list to store p-values
+p_value_ages <- list()
+
+# Define the groups
+group_A <- 2
+group_B <- 3
+
+# Loop through each feature to perform the Mann-Whitney U test
+for (feature_name in colnames(residuals_AP_2_3)) {
+  if (!(feature_name %in% c("Subject", "HYclass", "age"))) {
+    # Extract values for each group
+    group_A_values <- residuals_AP_2_3[[feature_name]][residuals_AP_2_3$HYclass == group_A]
+    group_B_values <- residuals_AP_2_3[[feature_name]][residuals_AP_2_3$HYclass == group_B]
+
+    # Perform the Mann-Whitney U test
+    p_value <- wilcox.test(group_A_values, group_B_values)$p.value
+
+    # Store the p-value in the list
+    p_value_ages[[feature_name]] <- p_value
+  }
+}
+
+# Convert the list to a data frame with the same format as p_values_AP
+p_values_age_adjusted_AP <- as.data.frame(t(unlist(p_value_ages)))
+
+# Display the p-values data frame
+print(p_values_age_adjusted_AP)
+
+
+
+```
+
+
+### B-Y Ranked p-values _AP
+
+```{r ranked_p_value_print_AP, echo = FALSE}
+# Benjamini-Yekutieli (BY) method this time to adjust for dependency
+
+#### FOR AGE ADJUSTMENT ONLY ##########
+p_values_AP <- p_values_age_adjusted_AP
+#######################################
+
+# Create a named vector of p-values
+# Assuming `p_values` is a data frame or matrix with variables as columns and one row of p-values
+p_val_vector <- sapply(colnames(p_values_AP), function(col_name) p_values_AP[[col_name]][1])
+names(p_val_vector) <- colnames(p_values_AP)
+
+# Sort the p-values
+sorted_p_vals <- sort(p_val_vector)
+
+# Threshold values
+thresholds_ap <-
+
+# Total number of tests (m) needed for the BY threshold calculation
+m <- length(sorted_p_vals)
+
+# Alpha for FDR level
+alpha <- 0.05
+
+# Calculate the correction factor for the BY method
+correction_factor <- sum(1/(1:m))
+
+# save results for later latex printing
+BY_results_AP <- data.frame(
+  Rank = integer(m),
+  Feature = names(sorted_p_vals),
+  P_Value = numeric(m),
+  Threshold = numeric(m),
+  Significance = character(m),
+  Effect_Size = numeric(m),
+  stringsAsFactors = FALSE
+)
+
+i <- 0
+
+# Loop through sorted p-values
+for (col_name in names(sorted_p_vals)) {
+  p_val <- sorted_p_vals[col_name]
+  rank <- which(names(sorted_p_vals) == col_name)
+
+  # Calculate the Benjamini-Yekutieli (BY) threshold for this p-value
+  by_threshold <- (rank/m) * (alpha / correction_factor)
+
+  # Determine if the p-value is significant under BY
+  significance <- if (p_val <= by_threshold) "*Significant" else "NS"
+  
+  # Store the results for later
+  # Find the appropriate row in BY_results_AP to store results based on Feature matching
+  row_index <- which(BY_results_AP$Feature == col_name)
+
+  i <- i + 1
+  # Store the results in the matched row
+  BY_results_AP[row_index, ] <- c(i, col_name, round(p_val,9), 
+                                  round(by_threshold, 6), significance, 
+                                  round(effect_values_AP[[col_name]], 2))
+
+  # Print the p-value and its BY significance
+  cat(rank, ":", col_name, ":", p_val, ":", " Thres :", by_threshold, " : ", significance, " r: ", round(effect_values_AP[[col_name]],2), "\n")
+}
+
+
+```
+
+
+
+
+
+## Bootstrap analysis
+
+### NB bootstrap assessment
+
+
+```{r nb_boots, echo = FALSE, cache = TRUE}
+
+# # this is to determine number of boots to use. Very long simulation. 
+# # 1100 was selected as good compromise.
+# 
+# # NB model
+# nbb_model  <- naive_Bayes() %>%
+#   set_engine("klaR") %>%
+#   set_mode("classification")
+# 
+# # NB workflow
+# nbb_workflow <- workflow() %>%
+#   add_model(nbb_model) %>%
+#   add_recipe(recipe_cv)
+# 
+# # Bootstrap sizes
+# BB <- c(2, 3,
+#        seq(5, 50, by = 5)
+#        ,
+#        seq(50, 250, by = 10)
+#        ,
+#        seq(250, 1000, by = 20)
+#        ,
+#        seq(1000, 2000, by = 50)
+#        ,
+#        seq(2000, 2500, by = 100)
+#        )
+# 
+# # Print the vector BB to check
+# print(BB)
+# 
+# 
+# # Arrays to store results
+# roc_auc_results <- numeric(length(BB))
+# roc_ci_lower <- numeric(length(BB))
+# roc_ci_upper <- numeric(length(BB))
+# f1_score_results <- numeric(length(BB))
+# f1_ci_lower <- numeric(length(BB))
+# f1_ci_upper <- numeric(length(BB))
+# 
+# # Start loop
+# for (i in seq_along(BB)) {
+#   set.seed(1000)
+#   bootstrap_resamples <- bootstraps(features_preprocessed, times = BB[i], strata = HYclass)
+# 
+#   # fit the nb
+#   nbb_fit <- nbb_workflow %>%
+#     # ensure the stack specific resampling CV is used
+#     fit_resamples(resamples = bootstrap_resamples,
+#                 control = control_resamples(save_pred = TRUE,
+#                                             save_workflow = TRUE),
+#     metrics = metric_set(roc_auc, f_meas))
+# 
+#   # Evaluate performance using yardstick
+#   nbb_metrics <- nbb_fit %>%
+#     collect_metrics()
+# 
+#   roc_auc_results[i] <- nbb_metrics$mean[2]
+#   f1_score_results[i] <- nbb_metrics$mean[1]
+# 
+#   nbb_predictions <- collect_predictions(nbb_fit)
+#   
+#   # 90 % CI
+#   nbb_auc_per_resample <- nbb_predictions %>%
+#     group_by(id) %>%
+#     roc_auc(., truth = HYclass, .pred_2) %>%
+#     reframe(AUC = .estimate)
+# 
+#   # Confidence Interval
+#   nbb_roc_quantile <- quantile(nbb_auc_per_resample$AUC, probs = c(0.05, 0.95))
+# 
+#   # now F1 score
+#   nbb_f1_per_resample <- nbb_predictions %>%
+#     group_by(id) %>%
+#     f_meas(., truth = HYclass, .pred_class) %>%
+#     reframe(F1_Score = .estimate)
+# 
+#   nbb_f1_quantile <- quantile(nbb_f1_per_resample$F1_Score, probs = c(0.05, 0.95))
+# 
+#   nbb_roc_quantile <- quantile(nbb_auc_per_resample$AUC, probs = c(0.05, 0.95))
+#   roc_ci_lower[i] <- nbb_roc_quantile[1]
+#   roc_ci_upper[i] <- nbb_roc_quantile[2]
+# 
+#   nbb_f1_quantile <- quantile(nbb_f1_per_resample$F1_Score, probs = c(0.05, 0.95))
+#   f1_ci_lower[i] <- nbb_f1_quantile[1]
+#   f1_ci_upper[i] <- nbb_f1_quantile[2]
+# 
+#   print(BB[i])
+# }
+# 
+# # Results as data frames
+# roc_auc_df <- data.frame(BB = BB, ROC_AUC = roc_auc_results,
+#                          CI_Lower = roc_ci_lower, CI_Upper = roc_ci_upper)
+# f1_score_df <- data.frame(BB = BB, F1_Score = f1_score_results,
+#                           CI_Lower = f1_ci_lower, CI_Upper = f1_ci_upper)
+# 
+# # Output the results
+# # list(ROC_AUC_Results = roc_auc_df, F1_Score_Results = f1_score_df)
+# 
+
+
+```
+
+
+
+```{r boot_plot, echo = FALSE}
+
+# # Combine the two data frames for easier plotting
+# combined_df <- data.frame(BB = roc_auc_df$BB,
+#                           ROC_AUC = roc_auc_df$ROC_AUC,
+#                           F1_Score = f1_score_df$F1_Score)
+# 
+# # combined_df <- x
+# 
+# # Save the dataframe to a CSV file
+# write.csv(combined_df,
+#           "boot_strap_analysis.csv",
+#           row.names = FALSE)
+# combined_df <- 
+#   read.csv("boot_strap_analysis.csv")
+# 
+# # Calculate moving averages
+# window_size <- 3  # Adjust as needed
+# combined_df$ROC_AUC_MA <- rollmean(combined_df$ROC_AUC, 
+#                                    window_size, align = "right", fill = NA)
+# combined_df$F1_Score_MA <- rollmean(combined_df$F1_Score, 
+#                                     window_size, align = "right", fill = NA)
+# 
+# upper_bound_roc <- combined_df$ROC_AUC_MA[length(combined_df$ROC_AUC_MA)] + 0.005
+# lower_bound_roc <- combined_df$ROC_AUC_MA[length(combined_df$ROC_AUC_MA)] - 0.005
+# 
+# upper_bound_f1 <- combined_df$F1_Score_MA[length(combined_df$F1_Score_MA)] + 0.005
+# lower_bound_f1 <- combined_df$F1_Score_MA[length(combined_df$F1_Score_MA)] - 0.005
+# 
+# 
+# # Plotting with horizontal double line
+# ggplot(data = combined_df) +
+#   geom_line(aes(x = BB, y = ROC_AUC, colour = "ROC AUC"), linewidth = 1) +
+#   geom_line(aes(x = BB, y = ROC_AUC_MA, colour = "ROC AUC Moving Average"), linewidth = 1, linetype = "dashed") +
+#   geom_line(aes(x = BB, y = F1_Score, colour = "F1 Score"), linewidth = 1) +
+#   geom_line(aes(x = BB, y = F1_Score_MA, colour = "F1 Score Moving Average"), linewidth = 1, linetype = "dashed") +
+#   geom_rect(aes(xmin = min(BB), xmax = max(BB), ymin = lower_bound_roc, 
+#                 ymax = upper_bound_roc), fill = "lightblue", alpha = 0.01) +
+#   geom_rect(aes(xmin = min(BB), xmax = max(BB), ymin = lower_bound_f1, 
+#                 ymax = upper_bound_f1), fill = "lightpink", alpha = 0.01) +
+#   labs(title = "ROC AUC and F1 metrics vs Bootstrap Size", x = "Bootstrap Size (B)", y = "Score") +
+#   scale_colour_manual(values = c("ROC AUC" = "blue", "F1 Score" = "red")) +
+#   theme_minimal() +
+#   theme(
+#     legend.position = c(0.8, 0.2),
+#     plot.title = element_text(hjust = 0.5, size = rel(1.4)),
+#     axis.title.x = element_text(size = rel(1.33)),
+#     axis.title.y = element_text(size = rel(1.33)),
+#     axis.text.x = element_text(size = rel(1.5)),
+#     axis.text.y = element_text(size = rel(1.5)),
+#     legend.text = element_text(size = rel(1.2)), 
+#     legend.title = element_text(size = rel(1.2)), 
+#     legend.key.size = unit(1.5, "lines") 
+#   ) + 
+#   labs(title = "ROC AUC and F1 metrics vs Bootstrap Size", 
+#        x = "Bootstrap Size (B)", 
+#        y = "Score",
+#        colour = "Legend")
+# 
+# 
+# 
+# #, "ROC AUC Moving Average" = "darkblue", "F1 Score Moving Average" = "darkred")) +
+
+```
+
+
+
+
+## Sex adjustment
+
+```{r}
+
+## REMEMBER ##
+# we can also take the residuals from age dependent data instead of features.
+# sex adjustment not done, this is just a look at the box plot
+
+# Merge the data frames based on the subject numbers
+features_AP_2_3_gender <- merge(features_AP_2_3, subjects[, c("sub_num", "gender")], by.x = "Subject", by.y = "sub_num", all.x = TRUE)
+
+# need long object for the plots and whiskers
+features_long_gender <- features_AP_2_3_gender %>% 
+  pivot_longer(
+    cols      = -c(Subject, HYclass, age, gender),  # keep identifiers
+    names_to  = "feature",
+    values_to = "value"
+  )
+
+# Calculate whisker limits for each feature
+whiskers <- features_long_gender %>% 
+  group_by(feature, gender) %>% 
+  summarise(
+    lo = quantile(value, .25, na.rm = TRUE) - 1.5 * IQR(value, na.rm = TRUE),
+    hi = quantile(value, .75, na.rm = TRUE) + 1.5 * IQR(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_data <- features_long_gender %>% 
+  left_join(whiskers, by = c("feature", "gender")) %>% 
+  filter(value >= lo & value <= hi)          
+
+# note that outliers have been cut back from the plots as they heavily skew the
+# y axis
+ggplot(plot_data, aes(gender, value, fill = gender)) +
+  geom_boxplot() +          
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(
+    title = "Box-plots of Features by Gender (axes cropped to whiskers)",
+    x     = "Gender",
+    y     = "Feature value",
+    fill  = "Gender"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+## Uni-feature power
+
+```{r unifeature_plots, echo=FALSE}
+
+# NON TRANSFORMED DATA DENSITY REVIEW
+
+# Colours for HYclass 2 and 3
+colors <- c("lightblue", "maroon", "lightgrey")
+
+
+# Replace NaNs with the mean of valid values, this is for the age 
+# which one subject has a NaN (missing subject age as per paper)
+replace_nan_with_mean <- function(x) {
+  x[is.nan(x)] <- mean(x[!is.nan(x)], na.rm = TRUE)
+  return(x)
+}
+
+# Loop over each column name
+for (colname in setdiff(names(features), c("HYclass", "Subject"))) {
+    # Filter the data for HYclass 2 and 3 for the current column
+    data_hy2 <- features[[colname]][features$HYclass == group_A]
+    data_hy3 <- features[[colname]][features$HYclass == group_B]
+    data_both <- features[[colname]][features$HYclass %in% c(group_A, group_B) ]
+    
+    data_hy2  <- replace_nan_with_mean(data_hy2)
+    data_hy3  <- replace_nan_with_mean(data_hy3)
+    data_both <- replace_nan_with_mean(data_both)
+
+    # Plot densities for HYclass 2 and 3
+    plot(density(data_hy2), col = colors[1], 
+         main = paste("Density of", colname, "for HYclass 2 and 3"), 
+         xlab = colname, ylab = "Density", 
+         xlim = c(min(c(min(density(data_hy2)$x), min(density(data_hy3)$x))),
+                  max(c(max(density(data_hy2)$x), max(density(data_hy3)$x)))),
+         ylim = c(0, max(c(max(density(data_hy2)$y), max(density(data_hy3)$y)))), 
+         lwd = 2, bg="transparent")
+
+    lines(density(data_hy3), col = colors[2], lwd = 2)
+    lines(density(data_both), col = colors[3], lwd = 2, lty = 3)
+
+    legend("topright", legend = c("HYclass 2", "HYclass 3", "Both"), fill = colors)
+}
+
+
+
+
+```
+
+
+
+```{r transformed_features_plot}
+# NORMALISED CENTRED SCALED DENSITY REVIEW
+
+# Colours for HYclass 2 and 3
+colors <- c("lightblue", "maroon", "lightgrey")
+
+# Loop over each column name
+for (colname in setdiff(names(features), c("HYclass", "Subject"))) {
+    # Filter the data for HYclass 2 and 3 for the current column
+    data_hy2 <- features_transformed[[colname]][features_transformed$HYclass == group_A]
+    data_hy3 <- features_transformed[[colname]][features_transformed$HYclass == group_B]
+    data_both <- features_transformed[[colname]][features_transformed$HYclass %in% c(group_A, group_B) ]
+    
+    data_hy2  <- replace_nan_with_mean(data_hy2)
+    data_hy3  <- replace_nan_with_mean(data_hy3)
+    data_both <- replace_nan_with_mean(data_both)
+
+    # Plot densities for HYclass 2 and 3
+    plot(density(data_hy2), col = colors[1], 
+         main = paste("Transformed density of", colname, "for HYclass 2 and 3"), 
+         xlab = colname, ylab = "Density", 
+         xlim = c(min(c(min(density(data_hy2)$x), min(density(data_hy3)$x))),
+                  max(c(max(density(data_hy2)$x), max(density(data_hy3)$x)))),
+         ylim = c(0, max(c(max(density(data_hy2)$y), max(density(data_hy3)$y)))), 
+         lwd = 2)
+
+    lines(density(data_hy3), col = colors[2], lwd = 2)
+    lines(density(data_both), col = colors[3], lwd = 2, lty = 3)
+
+    legend("topright", legend = c("HYclass 2", "HYclass 3", "Both"), fill = colors)
+}
+
+
+
+
+```
+
+
+
+### Direct ROC AUC
+
+
+```{r roc_auc_direct_ap, warning = FALSE, echo= FALSE}
+
+#### FOR AP USE RESIDUALS AS FEATURES
+features_AP <- residuals_AP_2_3
+
+# for removing youngest 3 features.
+# features_AP <- features_AP[features_AP$age >= 60, ]
+
+
+
+# data frame for the results
+auc_results_with_ci_ap <- data.frame(Feature = character(), 
+                                  ROC_AUC = numeric(), 
+                                  CI_Lower = numeric(), 
+                                  CI_Upper = numeric(),
+                                  stringsAsFactors = FALSE)
+
+set.seed(1000) # seed for repeatability
+# Loop through each feature except ID and class
+feature_names <- setdiff(names(features_AP), c("HYclass", "Subject"))
+for (colname in feature_names) {
+    # Filter data for HYclass 2 and 3
+    HYclass_2_data <- features_AP[[colname]][features_AP$HYclass == group_A]
+    HYclass_3_data <- features_AP[[colname]][features_AP$HYclass == group_B]
+
+    # Combine data and create a binary class vector
+    combined_data <- c(HYclass_2_data, HYclass_3_data)
+    combined_class <- c(rep(2, length(HYclass_2_data)), rep(3, length(HYclass_3_data)))
+
+    # Compute ROC AUC
+    roc_result <- roc(combined_class, combined_data)
+
+    # Calculate 95% Confidence Interval for the AUC
+    set.seed(1000) # seed so the bootstrapping samples are the same, needed
+    # to compare apples with apples for each result.
+    # Call ci.auc with parallel processing
+    ci <- ci.auc(roc = roc_result, conf.level = 0.95, 
+                 method = "bootstrap", boot.n = B, 
+                 boot.stratified = TRUE, parallel = TRUE)
+
+    # Append results to the data frame
+    auc_results_with_ci_ap <- rbind(auc_results_with_ci_ap, 
+                                 data.frame(Feature = colname, 
+                                            ROC_AUC = roc_result$auc, 
+                                            CI_Lower = ci[1], 
+                                            CI_Upper = ci[3]))
+    
+}
+
+# print(auc_results_with_ci)
+
+sorted_auc_results_ap <- arrange(auc_results_with_ci_ap, desc(ROC_AUC))
+print(sorted_auc_results_ap)
+
+### SAVE TO CSV so no need to run this snippet again.
+write.csv(auc_results_with_ci_ap, file =
+            "direct_roc_auc_ap.csv",
+          row.names = FALSE)
+
+
+```
+
+#### latex table format
+
+```{r}
+sorted_auc_results_ap$Correlation <- mean_corr_column[sorted_auc_results_ap$Feature]
+
+# Loop through each row and print
+apply(sorted_auc_results_ap, 1, function(x) {
+    cat(paste0(x["Feature"], " & ", 
+               round(as.numeric(x["ROC_AUC"]), 3), " & [", 
+               round(as.numeric(x["CI_Lower"]), 3), ", ", 
+               round(as.numeric(x["CI_Upper"]), 3), "] & ", 
+               round(as.numeric(x["Correlation"]), 3), " \\\\", "\n"))
+})
+
+```
+
+#### Combined Wilcoxon and AUC latex table
+
+
+```{r}
+
+
+sorted_auc_results_ap$Correlation <- mean_corr_column[sorted_auc_results_ap$Feature]
+
+# Loop through each row and print
+apply(sorted_auc_results_ap, 1, function(x) {
+  
+    # SKIP AGE as this does not exist in all DFs and also is not reportable
+    if (x["Feature"] == "age") {
+        return(NULL)
+    }
+  
+    # Extract matching row from BY_results_AP
+    matching_row <- BY_results_AP[BY_results_AP$Feature == x["Feature"], ]
+    p_val <- as.numeric(matching_row$P_Value)
+    threshold_val <- as.numeric(matching_row$Threshold)
+
+    # Conditional formatting for P_Value
+    if (p_val >= 1e-3) {
+        p_val_formatted <- sprintf("%.4f", p_val)
+    } else {
+        p_val_formatted <- formatC(p_val, format = "e", digits = 2)
+    }
+
+    # Format the threshold using fixed decimal places
+    threshold_formatted <- sprintf("%.4f", threshold_val)
+
+    # Print the formatted output
+    cat(paste0(x["Feature"], " & ", 
+               round(as.numeric(x["ROC_AUC"]), 3), " & [", 
+               round(as.numeric(x["CI_Lower"]), 3), ", ", 
+               round(as.numeric(x["CI_Upper"]), 3), "] & ",
+               p_val_formatted, " & ",
+               # threshold_formatted, " & ",
+               matching_row$Significance, # " & ",
+               # round(as.numeric(matching_row$Effect_Size), 2),  " & ",
+               # round(as.numeric(x["Correlation"]), 2), 
+               " \\\\", "\n"))
+})
+
+
+
+
+```
+
+
+### ROC CURVES
+
+```{r}
+plot(roc_result, 
+     main="",        
+     xlab="False Positive Rate", 
+     ylab="True Positive Rate",  
+     xlim=c(1, 0),              
+     ylim=c(0, 1),          
+     col="blue",             
+     lwd=2,
+     cex.lab=1.5,  
+     cex.axis=1.2,
+     cex.main=1.5)             
+
+
+```
+
+
+```{r}
+# calculate the ROC for the top 3/4 features
+########### WARNING ################
+# need to check the top 3/4 and name them in the next code:
+
+    # FIRST FEATURE
+    HYclass_2_data <- residuals_AP_2_3[["che_lum_max_rat_AP"]][residuals_AP_2_3$HYclass == group_A]
+    HYclass_3_data <- residuals_AP_2_3[["che_lum_max_rat_AP"]][residuals_AP_2_3$HYclass == group_B]
+
+    # Combine data and create a binary class vector
+    combined_data <- c(HYclass_2_data, HYclass_3_data)
+    combined_class <- c(rep(2, length(HYclass_2_data)), rep(3, length(HYclass_3_data)))
+
+    # Compute ROC AUC
+    roc_result_1 <- roc(combined_class, combined_data)
+    
+    # SECOND FEATURE
+    HYclass_2_data <- residuals_AP_2_3[["PR_8_12_AP"]][residuals_AP_2_3$HYclass == group_A]
+    HYclass_3_data <- residuals_AP_2_3[["PR_8_12_AP"]][residuals_AP_2_3$HYclass == group_B]
+
+    # Combine data and create a binary class vector
+    combined_data <- c(HYclass_2_data, HYclass_3_data)
+    combined_class <- c(rep(2, length(HYclass_2_data)), rep(3, length(HYclass_3_data)))
+
+    # Compute ROC AUC
+    roc_result_2 <- roc(combined_class, combined_data)
+    
+    # THIRD FEATURE
+    HYclass_2_data <- residuals_AP_2_3[["F95_max_AP"]][residuals_AP_2_3$HYclass == group_A]
+    HYclass_3_data <- residuals_AP_2_3[["F95_max_AP"]][residuals_AP_2_3$HYclass == group_B]
+
+    # Combine data and create a binary class vector
+    combined_data <- c(HYclass_2_data, HYclass_3_data)
+    combined_class <- c(rep(2, length(HYclass_2_data)), rep(3, length(HYclass_3_data)))
+
+    # Compute ROC AUC
+    roc_result_3 <- roc(combined_class, combined_data)
+    
+    # # FOURTH FEATURE
+    # HYclass_2_data <- residuals_AP_2_3[["F95_AP"]][residuals_AP_2_3$HYclass == group_A]
+    # HYclass_3_data <- residuals_AP_2_3[["F95_AP"]][residuals_AP_2_3$HYclass == group_B]
+    # 
+    # # Combine data and create a binary class vector
+    # combined_data <- c(HYclass_2_data, HYclass_3_data)
+    # combined_class <- c(rep(2, length(HYclass_2_data)), rep(3, length(HYclass_3_data)))
+    # 
+    # # Compute ROC AUC
+    # roc_result_4 <- roc(combined_class, combined_data)
+    
+
+
+# Plot the first ROC curve
+plot(roc_result_3, 
+     main="ROC curves",        
+     xlab="False Positive Rate", 
+     ylab="True Positive Rate",  
+     xlim=c(1, 0),              
+     ylim=c(0, 1),          
+     col="blue",             
+     lwd=2,
+     cex.lab=2.4,  
+     cex.axis=2.05,
+     cex.main=2.4)    
+
+# Add the second ROC curve
+lines(roc_result_2, col="red", lwd=2)
+
+# Add the third ROC curve
+lines(roc_result_1, col="purple", lwd=2)
+
+# Add the fourth ROC curve
+# lines(roc_result_1, col="purple", lwd=2)
+
+# Add the legend
+legend("bottomright", 
+       legend=c("Chest to lumbar maximum ratio", 
+                "Power ratio 8 to 12 Hz over total", 
+                "Maximum frequency of 95% power" 
+                # "Frequency range of 95% power"
+                ), 
+       col=c("purple", "red", "blue"), 
+       lwd=2, 
+       cex=1.8,
+       bty="n", 
+       x.intersp=0.1,          # Reduce the horizontal spacing
+       y.intersp=0.4,          # Reduce the vertical spacing
+       inset=c(-0.28, -0.05))    # Move the legend closer to the plot
+
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# # Open a PDF device
+# pdf("roc_curves.pdf", width = 8.5, height = 8.5)  # Set the width and height as needed
+# 
+# # fig = c(x1, x2, y1, y2): the fractional area of the figure to use for plotting
+# par(fig = c(0.02, 0.98, 0.02, 0.98))
+# 
+# 
+# # Plot the first ROC curve
+# plot(roc_result_3, 
+#      main="",        
+#      xlab="", 
+#      ylab="",  
+#      xlim=c(1, 0),              
+#      ylim=c(0, 1),          
+#      col="blue",             
+#      lwd=2,
+#      cex.lab=2,  
+#      cex.axis=1.75,
+#      cex.main=2.2)    
+# 
+# 
+# # title(main = "ROC curves", line = 5.5, cex.main = 2.2)
+# # title(xlab = "False Positive Rate", line = 5.5, cex.lab = 2)
+# # title(ylab = "True Positive Rate", line = 5.5, cex.lab = 2)
+# 
+# mtext("ROC curves", side = 3, line = 3.425, cex = 2.2, font = 2)
+# mtext("False Positive Rate", side = 1, line = 4.25, cex = 1.8)
+# mtext("True Positive Rate",  side = 2, line = 3.25, cex = 1.8)
+# 
+# 
+# par(xpd = TRUE)
+# # Add the second ROC curve
+# lines(roc_result_2, col="red", lwd=2)
+# 
+# # Add the third ROC curve
+# lines(roc_result_1, col="purple", lwd=2)
+# 
+# # Add the fourth ROC curve
+# # lines(roc_result_1, col="purple", lwd=2)
+# 
+# # Add the legend
+# legend("bottomright", 
+#        legend=c("Chest to lumbar maximum ratio", 
+#                 "Power ratio 8 to 12 Hz over total", 
+#                 "Maximum frequency of 95% power" #, 
+#                 # "Frequency range of 95% power"
+#                 ),
+#        col=c(#"purple",
+#              "purple", "red", "blue"), 
+#        lwd=2, 
+#        cex=1.7,
+#        bty="n", 
+#        x.intersp=1,          # legend
+#        y.intersp=1,          # Reduce the vertical spacing
+#        inset=c(0, 0))    # Move the legend closer to the plot
+# 
+# # Close the PDF device
+# dev.off()
+
+
+```
+
+
